@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import sqlite3
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -14,12 +15,49 @@ TOKEN = os.getenv("BOT_TOKEN")
 
 # Два админа. Впиши сюда свои реальные Telegram ID (узнать можно у @userinfobot)
 ADMINS = [
-    6378471773,   # <-- ID первого админа (тебя)
-    5708284946,   # <-- ID второго админа
+    6378471773,  # <-- ID первого админа (тебя)
+    5708284946,  # <-- ID второго админа
 ]
 
 # Название бота, для которого работает поддержка
 TARGET_BOT = "@manhwcardbot"
+
+# ============================ БАЗА ДАННЫХ ============================
+
+# Подключаемся к SQLite (файл создастся автоматически в папке со скриптом)
+conn = sqlite3.connect("support_bot.db", check_same_thread=False)
+cursor = conn.cursor()
+
+# Создаем таблицу, если её еще нет
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS reply_map (
+        admin_chat_id INTEGER,
+        message_id INTEGER,
+        user_id INTEGER,
+        PRIMARY KEY (admin_chat_id, message_id)
+    )
+""")
+conn.commit()
+
+
+def save_reply_link(admin_chat_id: int, message_id: int, user_id: int):
+    """Сохраняет связь между скопированным сообщением у админа и реальным юзером"""
+    cursor.execute(
+        "INSERT OR REPLACE INTO reply_map (admin_chat_id, message_id, user_id) VALUES (?, ?, ?)",
+        (admin_chat_id, message_id, user_id)
+    )
+    conn.commit()
+
+
+def get_user_id(admin_chat_id: int, message_id: int) -> int | None:
+    """Достает ID юзера по реплаю админа"""
+    cursor.execute(
+        "SELECT user_id FROM reply_map WHERE admin_chat_id = ? AND message_id = ?",
+        (admin_chat_id, message_id)
+    )
+    row = cursor.fetchone()
+    return row[0] if row else None
+
 
 # ============================ ИНИЦИАЛИЗАЦИЯ ============================
 
@@ -29,10 +67,6 @@ bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
-
-# Карта связей: (chat_id_админа, id_скопированного_сообщения) -> id_пользователя
-# Нужна, чтобы понять, кому именно отвечает админ реплаем.
-reply_map: dict[tuple[int, int], int] = {}
 
 # ============================ ТЕКСТЫ ============================
 
@@ -60,6 +94,7 @@ ADMIN_GREETING = (
 
 USER_SENT = "✅ <b>Сообщение отправлено в поддержку!</b>\nМы ответим тебе прямо здесь. Ожидай ⏳"
 
+
 # ============================ ХЭНДЛЕРЫ ============================
 
 @router.message(CommandStart())
@@ -69,6 +104,7 @@ async def cmd_start(message: Message):
     else:
         await message.answer(GREETING)
 
+
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     if message.from_user.id in ADMINS:
@@ -76,23 +112,30 @@ async def cmd_help(message: Message):
     else:
         await message.answer(GREETING)
 
+
 # --- Ответ администратора (реплай на сообщение пользователя) ---
 @router.message(F.from_user.id.in_(ADMINS), F.reply_to_message)
 async def admin_reply(message: Message):
-    key = (message.chat.id, message.reply_to_message.message_id)
-    user_id = reply_map.get(key)
+    admin_chat_id = message.chat.id
+    message_id = message.reply_to_message.message_id
+
+    # Достаем ID пользователя из БД
+    user_id = get_user_id(admin_chat_id, message_id)
 
     if user_id is None:
         await message.reply(
             "⚠️ Не могу определить пользователя.\n"
-            "Отвечай реплаем именно на пересланное сообщение пользователя."
+            "Отвечай реплаем именно на пересланное сообщение пользователя, либо это сообщение было отправлено до внедрения БД."
         )
         return
     try:
         await message.copy_to(chat_id=user_id)
         await message.reply("✅ Ответ отправлен пользователю.")
     except Exception as e:
-        await message.reply(f"❌ Не удалось отправить ответ.\nВозможно, пользователь заблокировал бота.\n\n<code>{e}</code>")
+        await message.reply(
+            f"❌ Не удалось отправить ответ.\nВозможно, пользователь заблокировал бота.\n\n<code>{e}</code>")
+
+
 # --- Сообщение от админа без реплая (подсказка) ---
 @router.message(F.from_user.id.in_(ADMINS))
 async def admin_no_reply(message: Message):
@@ -100,6 +143,7 @@ async def admin_no_reply(message: Message):
         "ℹ️ Чтобы ответить пользователю — <b>свайпни его сообщение</b> "
         "(нажми «Ответить») и напиши ответ."
     )
+
 
 # --- Сообщение от обычного пользователя ---
 @router.message(F.chat.type == "private")
@@ -120,7 +164,10 @@ async def user_message(message: Message):
         try:
             await bot.send_message(admin_id, header)
             copied = await message.copy_to(chat_id=admin_id)
-            reply_map[(admin_id, copied.message_id)] = user.id
+
+            # Сохраняем связь в базу данных
+            save_reply_link(admin_id, copied.message_id, user.id)
+
             delivered = True
         except Exception as e:
             logging.warning(f"Не удалось доставить сообщение админу {admin_id}: {e}")
@@ -130,11 +177,17 @@ async def user_message(message: Message):
     else:
         await message.answer("⚠️ Не удалось доставить сообщение. Попробуй позже.")
 
+
 # ============================ ЗАПУСК ============================
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        # Закрываем соединение с БД при остановке бота
+        conn.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
