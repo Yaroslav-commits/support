@@ -24,8 +24,12 @@ TARGET_BOT = "@manhwcardbot"
 
 # ============================ БАЗА ДАННЫХ ============================
 
-# Подключаемся к SQLite (файл создастся автоматически в папке со скриптом)
-conn = sqlite3.connect("support_bot.db", check_same_thread=False)
+# Создаем папку data, если её еще нет, чтобы не было ошибки при создании БД
+os.makedirs("data", exist_ok=True)
+
+# Подключаемся к SQLite (файл создастся автоматически в папке data)
+db_path = os.path.join("data", "support_bot.db")
+conn = sqlite3.connect(db_path, check_same_thread=False)
 cursor = conn.cursor()
 
 # Создаем таблицу, если её еще нет
